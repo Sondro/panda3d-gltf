@@ -1,5 +1,6 @@
-import math
 import base64
+import itertools
+import math
 import struct
 import pprint # pylint: disable=unused-import
 
@@ -12,8 +13,43 @@ except ImportError:
 
 
 class Converter():
+    _COMPONENT_TYPE_MAP = {
+        5120: GeomEnums.NT_int8,
+        5121: GeomEnums.NT_uint8,
+        5122: GeomEnums.NT_int16,
+        5123: GeomEnums.NT_uint16,
+        5124: GeomEnums.NT_int32,
+        5125: GeomEnums.NT_uint32,
+        5126: GeomEnums.NT_float32,
+    }
+    _COMPONENT_NUM_MAP = {
+        'MAT4': 16,
+        'VEC4': 4,
+        'VEC3': 3,
+        'VEC2': 2,
+        'SCALAR': 1,
+    }
+    _ATTRIB_CONENT_MAP = {
+        'position': GeomEnums.C_point,
+        'normal': GeomEnums.C_normal,
+        'texcoord': GeomEnums.C_texcoord,
+        'color': GeomEnums.C_color,
+    }
+    _ATTRIB_NAME_MAP = {
+        'position': 'vertex',
+    }
+    _PRIMITIVE_MODE_MAP = {
+        0: GeomPoints,
+        1: GeomLines,
+        3: GeomLinestrips,
+        4: GeomTriangles,
+        5: GeomTristrips,
+        6: GeomTrifans,
+    }
+
     def __init__(self):
         self.cameras = {}
+        self.buffers = {}
         self.lights = {}
         self.textures = {}
         self.mat_states = {}
@@ -35,6 +71,9 @@ class Converter():
         #pprint.pprint(gltf_data)
 
         # Convert data
+        for buffid, gltf_buffer in enumerate(gltf_data.get('buffers', [])):
+            self.load_buffer(buffid, gltf_buffer)
+
         for camid, gltf_cam in enumerate(gltf_data.get('cameras', [])):
             self.load_camera(camid, gltf_cam)
 
@@ -51,7 +90,7 @@ class Converter():
             self.load_material(matid, gltf_mat)
 
         for meshid, gltf_mesh in enumerate(gltf_data.get('meshes', [])):
-            self.load_mesh(meshid, gltf_mesh, gltf_data)
+            self.load_mesh_new(meshid, gltf_mesh, gltf_data)
 
         for nodeid, gltf_node in enumerate(gltf_data.get('nodes', [])):
             node_name = gltf_node.get('name', 'node'+str(nodeid))
@@ -251,6 +290,19 @@ class Converter():
     def load_quaternion_as_hpr(self, quaternion):
         quat = LQuaternion(quaternion[3], quaternion[0], quaternion[1], quaternion[2])
         return quat.get_hpr()
+
+    def load_buffer(self, buffid, gltf_buffer):
+        uri = gltf_buffer['uri']
+        if uri.startswith('data:application/octet-stream;base64'):
+            buff_data = gltf_buffer['uri'].split(',')[1]
+            buff_data = base64.b64decode(buff_data)
+        else:
+            print(
+                "Buffer {} has an unsupported uri ({}), using a zero filled buffer instead"
+                .format(buffid, uri)
+            )
+            buff_data = bytearray(gltf_buffer['byteLength'])
+        self.buffers[buffid] = buff_data
 
     def make_texture_srgb(self, texture):
         if texture.get_num_components() == 3:
@@ -540,6 +592,132 @@ class Converter():
 
         return jvtmap
 
+    def load_primitive(self, geom_node, gltf_primitive, gltf_data):
+        # Build Vertex Format
+        vformat = GeomVertexFormat()
+        mesh_attribs = gltf_primitive['attributes']
+        accessors = [
+            {**gltf_data['accessors'][acc_idx], 'attrib': attrib_name}
+            for attrib_name, acc_idx in mesh_attribs.items()
+        ]
+        accessors = sorted(accessors, key=lambda x: x['bufferView'])
+        data_copies = []
+        for buffview, accs in itertools.groupby(accessors, key=lambda x: x['bufferView']):
+            buffview = gltf_data['bufferViews'][buffview]
+            accs = sorted(accs, key=lambda x: x['byteOffset'])
+            is_interleaved = len(accs) > 1 and accs[1]['byteOffset'] < buffview['byteStride']
+
+            varray = GeomVertexArrayFormat()
+            for acc in accs:
+                # Gather column information
+                attrib_parts = acc['attrib'].lower().split('_')
+                attrib_name = self._ATTRIB_NAME_MAP.get(attrib_parts[0], attrib_parts[0])
+                if len(attrib_parts) > 1:
+                    internal_name = InternalName.make(attrib_name, attrib_parts[1])
+                else:
+                    internal_name = InternalName.make(attrib_name)
+                num_components = self._COMPONENT_NUM_MAP[acc['type']]
+                numeric_type = self._COMPONENT_TYPE_MAP[acc['componentType']]
+                content = self._ATTRIB_CONENT_MAP.get(attrib_name, GeomEnums.C_other)
+
+                # Add this accessor as a column to the current vertex array format
+                varray.add_column(internal_name, num_components, numeric_type, content)
+
+                if not is_interleaved:
+                    # Start a new vertex array format
+                    vformat.add_array(varray)
+                    varray = GeomVertexArrayFormat()
+                    data_copies.append((
+                        buffview['buffer'],
+                        acc['byteOffset'] + buffview['byteOffset'],
+                        acc['count'],
+                        buffview.get('byteStride', 1)
+                    ))
+
+            if is_interleaved:
+                vformat.add_array(varray)
+                data_copies.append((
+                    buffview['buffer'],
+                    buffview['byteOffset'],
+                    accs[0]['count'],
+                    buffview.get('byteStride', 1)
+                ))
+
+        # Copy data from buffers
+        reg_format = GeomVertexFormat.register_format(vformat)
+        vdata = GeomVertexData(geom_node.name, reg_format, GeomEnums.UH_stream)
+
+        for array_idx, data_info in enumerate(data_copies):
+            handle = vdata.modify_array(array_idx).modify_handle()
+            handle.unclean_set_num_rows(data_info[2])
+
+            buff = self.buffers[data_info[0]]
+            start = data_info[1]
+            end = start + data_info[2] * data_info[3]
+            handle.copy_data_from(buff[start:end])
+            handle = None
+
+        # Construct primitive
+        primitiveid = geom_node.get_num_geoms()
+        try:
+            prim = self._PRIMITIVE_MODE_MAP[gltf_primitive['mode']](GeomEnums.UH_static)
+        except KeyError:
+            print(
+                "Warning: primitive {} on mesh {} has an unsupported mode"
+                .format(primitiveid, geom_node.name)
+            )
+            prim = GeomPoints(GeomEnums.UH_static)
+
+        if 'indices' in gltf_primitive:
+            index_acc = gltf_data['accessors'][gltf_primitive['indices']]
+            prim.set_index_type(self._COMPONENT_TYPE_MAP[index_acc['componentType']])
+
+            handle = prim.modify_vertices(index_acc['count']).modify_handle()
+            handle.unclean_set_num_rows(index_acc['count'])
+
+            buffview = gltf_data['bufferViews'][index_acc['bufferView']]
+            buff = self.buffers[buffview['buffer']]
+            start = buffview['byteOffset']
+            end = start + index_acc['count'] * buffview.get('byteStride', 1) * prim.index_stride
+            handle.copy_data_from(buff[start:end])
+            handle = None
+
+        # Assign a material
+        matid = gltf_primitive.get('material', None)
+        if matid is None:
+            print(
+                "Warning: mesh {} has a primitive with no material, using an empty RenderState"
+                .format(geom_node.name)
+            )
+            mat = RenderState.make_empty()
+        elif matid not in self.mat_states:
+            print(
+                "Warning: material with name {} has no associated mat state, using an empty RenderState"
+                .format(matid)
+            )
+            mat = RenderState.make_empty()
+        else:
+            mat = self.mat_states[gltf_primitive['material']]
+            self.mat_mesh_map[gltf_primitive['material']].append((geom_node.name, primitiveid))
+
+        # Add this primitive back to the geom node
+        geom = Geom(vdata)
+        geom.add_primitive(prim)
+        geom_node.add_geom(geom, mat)
+
+    def load_mesh_new(self, meshid, gltf_mesh, gltf_data):
+        mesh_name = gltf_mesh.get('name', 'mesh'+str(meshid))
+        node = self.meshes.get(meshid, GeomNode(mesh_name))
+
+        # Clear any existing mesh data
+        node.remove_all_geoms()
+
+        # Load primitives
+        for gltf_primitive in gltf_mesh['primitives']:
+            self.load_primitive(node, gltf_primitive, gltf_data)
+
+        # Save mesh
+        self.meshes[meshid] = node
 
     def load_mesh(self, meshid, gltf_mesh, gltf_data):
         node = self.meshes.get(meshid, GeomNode(gltf_mesh['name']))
